@@ -21,6 +21,9 @@ chimera-synteny C-00000000 C-111111111 C-22222222 C-3333333 --email "example@exa
 
 Replacing the CLIMB IDs with real IDs, and the email address as appropriate (used for querying Entrez)
 
+You can additionally specify the path to a [taxaPlease](https://github.com/ukhsa-collaboration/gpha-mscape-taxaplease)
+database using the `--database` argument, or provide local bam files as an argument instead of CLIMB IDs.
+
 ## What is Chimera?
 
 That would be this: <https://github.com/CLIMB-TRE/chimera>

@@ -18,13 +18,13 @@ from taxaplease import TaxaPlease
 from tqdm import tqdm
 from functional import pseq
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 ###########
 # Globals #
 ###########
 
-TESTING = True
+TESTING = False
 SAMTOOLS_CMD = "conda run -n samtools samtools"
 
 ## harmless pandas options
