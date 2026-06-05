@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import importlib
+from importlib import resources
 import argparse
 import datetime
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -16,14 +17,6 @@ from onyx import OnyxClient, OnyxConfig, OnyxEnv, OnyxField
 from taxaplease import TaxaPlease
 from tqdm import tqdm
 from functional import pseq
-
-# Set up config
-config = OnyxConfig(
-    domain=os.environ[OnyxEnv.DOMAIN],
-    token=os.environ[OnyxEnv.TOKEN],
-)
-
-tp = TaxaPlease()
 
 __version__ = "0.0.2"
 
@@ -45,8 +38,8 @@ config = OnyxConfig(
     token=os.environ[OnyxEnv.TOKEN],
 )
 
-## init taxaplease
-tp = TaxaPlease()
+## init taxaplease as none - to overwrite in main
+tp = None
 
 
 #############
@@ -85,8 +78,26 @@ def init_argparser():
         help="Allow Virgaviridae in output (Tobacco Mosaic Virus)",
         action="store_true",
     )
+    parser.add_argument(
+        "--onyx-project",
+        help="Speicfy Onyx project to use (mSCAPE/synthscape)",
+        default="mscape"
+    )
+    parser.add_argument(
+        "--database",
+        help="Path to a TaxaPlease database",
+        default=None,
+    )
 
     return parser
+
+
+def resolve_samtools_path():
+    samtools_path = shutil.which("samtools")
+    if samtools_path:
+        return shlex.quote(samtools_path)
+
+    return SAMTOOLS_CMD
 
 
 def get_file_from_s3(*, input_s3_uri=None, output_folder=None):
@@ -102,7 +113,7 @@ def get_file_from_s3(*, input_s3_uri=None, output_folder=None):
     return str(outfile_path)
 
 
-def get_chimera_bam_uri_by_climb_id(input_climb_id_list):
+def get_chimera_bam_uri_by_climb_id(input_climb_id_list, onyx_project):
     """
     Takes in a list of climb ids
     Returns a dataframe with the columns climb_id and chimera_bam
@@ -118,7 +129,7 @@ def get_chimera_bam_uri_by_climb_id(input_climb_id_list):
     with OnyxClient(config) as client:
         return_data = pd.DataFrame(
             client.query(
-                project="mscape",
+                project=onyx_project,
                 query=(OnyxField(climb_id__in=input_climb_id_list)),
                 include=("climb_id", "chimera_bam"),
             )
@@ -138,12 +149,17 @@ def process_bam_uri_to_pileup_gz(input_bam_uri, *, outdir=None):
         return outfilepath
 
     with tempfile.TemporaryDirectory() as tempdir:
-        bam_file = get_file_from_s3(input_s3_uri=input_bam_uri, output_folder=tempdir)
+        if Path(input_bam_uri).is_file():
+            bam_file = input_bam_uri
+        else:
+            bam_file = get_file_from_s3(input_s3_uri=input_bam_uri, output_folder=tempdir)
 
         if not bam_file:
             print(f"Failed to retrieve {input_bam_uri}")
 
-        cmd = f"{SAMTOOLS_CMD} mpileup -a {shlex.quote(bam_file)} | cut -f 1,2,4 | gzip > {shlex.quote(outfilepath)}"
+        ## this will prefer samtools on PATH, otherwise uses a conda fallback
+        samtools_cmd = resolve_samtools_path()
+        cmd = f"{samtools_cmd} mpileup -a {shlex.quote(bam_file)} | cut -f 1,2,4 | gzip > {shlex.quote(outfilepath)}"
 
         os.system(cmd)
 
@@ -417,41 +433,44 @@ def figure_array_to_html(
 
 
 def get_js_text():
-    with importlib.resources.path("chimera_synteny", "data/main.js") as f:
-        return f.read_text()
+    return resources.files("chimera_synteny.data").joinpath("main.js").read_text()
 
 
 def get_css_text():
-    with importlib.resources.path("chimera_synteny", "data/main.css") as f:
-        return f.read_text()
+    return resources.files("chimera_synteny.data").joinpath("main.css").read_text()
 
 
 def get_lookup_path():
-    with importlib.resources.path("chimera_synteny", "data/lookup.txt") as f:
-        return str(f)
+    return str(
+        resources.files("chimera_synteny.data").joinpath("lookup.txt")
+    )
 
 
 def generate_report(
-    list_of_climb_ids_to_process,
+    input,
     *,
     outdir=None,
     suppress_ttv=True,
     suppress_singleton_families=True,
     suppress_phage=True,
     suppress_tmv=True,
+    onyx_project
 ):
     ## make an output directory
     Path(outdir).mkdir(exist_ok=True)
 
-    ## get the chimera URIs
-    print(f"{datetime.datetime.now()} Querying Onyx...")
-    climb_id_to_chimera_uri_df = get_chimera_bam_uri_by_climb_id(
-        list_of_climb_ids_to_process
-    )
+    local_bams = [x for x in input if Path(x).is_file()]
+    climb_ids  = list(set(input) - set(local_bams))
 
-    ## download and process bams in parallel
+    s3_uris = []
+    if climb_ids:
+        print(f"{datetime.datetime.now()} Querying Onyx...")
+        climb_id_to_chimera_uri_df = get_chimera_bam_uri_by_climb_id(climb_ids, onyx_project)
+        s3_uris = list(climb_id_to_chimera_uri_df["chimera_bam"])
+
+    ## download (if needed) and process bams in parallel
     print(f"{datetime.datetime.now()} Retrieving bams and generating pileups")
-    pileup_filepath_list = pseq(list(climb_id_to_chimera_uri_df["chimera_bam"])).map(
+    pileup_filepath_list = pseq(local_bams + s3_uris).map(
         lambda x: process_bam_uri_to_pileup_gz(x, outdir=outdir)
     )
 
@@ -480,7 +499,7 @@ def generate_report(
         print(f"{datetime.datetime.now()} Processing pileups into figures")
 
         for pileup in tqdm(
-            pileup_filepath_list, total=len(list_of_climb_ids_to_process)
+            pileup_filepath_list, total=len(input)
         ):
             outhtml.write("<div class='figureAndHeaderContainer'>\n")
             outhtml.write(f"<h2>{os.path.basename(pileup)}</h2>\n")
@@ -523,11 +542,12 @@ def generate_report(
 
 
 def main():
-    global ENTREZ_EMAIL
+    global ENTREZ_EMAIL, tp
 
     args = init_argparser().parse_args()
 
     ENTREZ_EMAIL = args.email
+    tp = TaxaPlease(database=args.database) if args.database else TaxaPlease()
 
     generate_report(
         args.input,
@@ -536,6 +556,7 @@ def main():
         suppress_singleton_families=not args.allow_singleton,
         suppress_phage=not args.allow_phage,
         suppress_tmv=not args.allow_tmv,
+        onyx_project=args.onyx_project
     )
 
 
